@@ -79,9 +79,9 @@ def _load_env():
     # Load .env files if python-dotenv is available
     if load_dotenv:
         load_dotenv(BASE_DIR / ".env", override=False)
-        load_dotenv(BASE_DIR / "secrets" / ".env", override=True)
+        load_dotenv(BASE_DIR / ".env", override=True)
     # Optional JSON fallback
-    cfg = BASE_DIR / "secrets" / "config.json"
+    cfg = BASE_DIR / "config.json"
     if cfg.exists():
         data = json.loads(cfg.read_text())
         for k, v in data.items():
