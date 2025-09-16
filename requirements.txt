@@ -1,0 +1,26 @@
+gradio==4.44.0
+requests>=2.31.0
+numpy>=1.24,<2.0
+pandas==2.2.2
+tqdm>=4.66.1
+pydub==0.25.1
+soundfile>=0.12.1
+
+# Transcription
+faster-whisper==1.0.3
+# ctranslate2 comes via faster-whisper
+
+# OCR (board text)
+pytesseract==0.3.10
+Pillow>=10.2.0
+
+# Video download
+yt-dlp==2025.01.15
+
+# Providers
+groq==0.11.0
+openai>=1.35.9
+google-cloud-aiplatform>=1.56.0
+
+# If you use OpenCV anywhere, prefer headless build on servers:
+opencv-python-headless==4.10.0.84
