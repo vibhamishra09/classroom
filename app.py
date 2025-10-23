@@ -16,15 +16,31 @@ import requests
 import gradio as gr
 from faster_whisper import WhisperModel
 
+# NEW: OpenAI + Gemini SDKs
+try:
+    from openai import OpenAI
+except Exception:
+    OpenAI = None
+try:
+    import google.generativeai as genai
+except Exception:
+    genai = None
+
 # ────────────────────────────────────────────────────────────────────────────────
 # QUICK ENV SETUP (examples)
 #   # Groq:
 #   #   GROQ_API_KEY, GROQ_MODEL (default openai/gpt-oss-120b), GROQ_SCOUT_MODEL
 #   #
 #   # OpenRouter:
-#   #   OPENROUTER_API_KEY  (we use only these two models you kept)
+#   #   OPENROUTER_API_KEY
 #   #   - deepseek/deepseek-r1-distill-llama-70b
 #   #   - google/gemma-2-9b-it
+#   #
+#   # OpenAI (GPT-4o-mini or other):
+#   #   OPENAI_API_KEY, OPENAI_MODEL (default gpt-4o-mini)
+#   #
+#   # Google Gemini (2.0 Flash by default):
+#   #   GEMINI_API_KEY, GEMINI_MODEL (default gemini-2.0-flash)
 #   #
 #   # Gmail (app-level email only):
 #   #   GMAIL_USER, GMAIL_APP_PASSWORD  (App Password required)
@@ -76,12 +92,10 @@ for p in (WORK_DIR, AUDIO_DIR, UPLOAD_DIR, BOARD_DIR):
 os.environ.setdefault("GRADIO_TEMP_DIR", str(UPLOAD_DIR))
 
 def _load_env():
-    # Load .env files if python-dotenv is available
     if load_dotenv:
         load_dotenv(BASE_DIR / ".env", override=False)
-        load_dotenv(BASE_DIR / ".env", override=True)
-    # Optional JSON fallback
-    cfg = BASE_DIR / "config.json"
+        load_dotenv(BASE_DIR / "secrets" / ".env", override=True)
+    cfg = BASE_DIR / "secrets" / "config.json"
     if cfg.exists():
         data = json.loads(cfg.read_text())
         for k, v in data.items():
@@ -110,8 +124,8 @@ BOARD_WHITE_PCT   = float(os.getenv("BOARD_WHITE_PCT", "0.22"))
 BOARD_DARK_PCT    = float(os.getenv("BOARD_DARK_PCT", "0.22"))
 
 # ===================== Gmail SMTP ENV =====================
-GMAIL_USER = os.getenv("GMAIL_USER","vibhamishra0907@gmail.com")
-GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD","cnoy tymz mzty qaaz")
+GMAIL_USER = os.getenv("GMAIL_USER")
+GMAIL_APP_PASSWORD = os.getenv("GMAIL_APP_PASSWORD")
 SMTP_DEBUG = os.getenv("SMTP_DEBUG", "0") == "1"
 
 # ===================== Groq ENV =====================
@@ -125,13 +139,30 @@ GROQ_SCOUT_MODEL      = os.getenv("GROQ_SCOUT_MODEL", "meta-llama/llama-4-scout-
 GROQ_SCOUT_MAX_TOKENS = int(os.getenv("GROQ_SCOUT_MAX_TOKENS", "900"))
 GROQ_SCOUT_TEMP       = float(os.getenv("GROQ_SCOUT_TEMP", "0.2"))
 
-# ===================== Ollama (feedback only; Q&A is heuristic) =====================
+# ===================== OpenAI ENV (NEW) =====================
+OPENAI_API_KEY    = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL      = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+OPENAI_MAX_TOKENS = int(os.getenv("OPENAI_MAX_TOKENS", "900"))
+OPENAI_TEMP       = float(os.getenv("OPENAI_TEMP", "0.2"))
+
+# ===================== Gemini ENV =====================
+GEMINI_API_KEY     = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL       = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_TEMP        = float(os.getenv("GEMINI_TEMP", "0.2"))
+GEMINI_MAX_TOKENS  = int(os.getenv("GEMINI_MAX_TOKENS", "1200"))
+GEMINI_CHUNK_CHARS = int(os.getenv("GEMINI_CHUNK_CHARS", "7000"))
+GEMINI_OVERLAP     = int(os.getenv("GEMINI_OVERLAP", "500"))
+
+# ===================== Ollama (feedback only) =====================
 def _ollama_base_url() -> str:
-    raw = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434")
+    raw = (os.getenv("OLLAMA_URL", "http://127.0.0.1:11434") or "").strip()
+    raw = raw.rstrip("/")
+    if raw.endswith("/api"):
+        raw = raw[:-4]
     u = urlparse(raw)
     scheme = u.scheme or "http"
-    host = u.hostname or "127.0.0.1"
-    port = u.port or 11434
+    host   = u.hostname or "127.0.0.1"
+    port   = u.port or 11434
     return f"{scheme}://{host}:{port}"
 
 def _ollama_probe_or_raise():
@@ -140,8 +171,6 @@ def _ollama_probe_or_raise():
 
 # ===================== OpenRouter ENV =====================
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-
-# Only the two you kept:
 OPENROUTER_MODELS = {
     "or_deepseek_r1d_70b": "deepseek/deepseek-r1-distill-llama-70b",
     "or_gemma2_9b_it":     "google/gemma-2-9b-it",
@@ -160,6 +189,19 @@ model = WhisperModel(
     compute_type=COMPUTE_TYPE,
     download_root=str(WORK_DIR / "models"),
 )
+
+
+# ===================== Text chunk util (Gemini map-reduce) =====================
+def _chunk_text(text: str, target_chars: int = 7000, overlap: int = 500):
+    text = text or ""
+    if len(text) <= target_chars:
+        return [text]
+    chunks, i = [], 0
+    step = max(target_chars - overlap, 1000)
+    while i < len(text):
+        chunks.append(text[i:i+target_chars])
+        i += step
+    return chunks
 
 # ===================== Small utils =====================
 def _which(bin_name: str) -> Optional[str]:
@@ -202,7 +244,7 @@ def _normalize_uploaded(vpath):
         return None
     if isinstance(vpath, str):
         return vpath
-    if isinstance(vpath, (list, tuple)) and vpath:
+    if isinstance(vpath, (list, tuple)) and v:
         return vpath[0]
     if isinstance(vpath, dict):
         return vpath.get("name") or vpath.get("path")
@@ -301,10 +343,6 @@ def _is_http_url(s: Optional[str]) -> bool:
         return False
 
 def _download_media_from_url(url: str, dest_dir: Path) -> Path:
-    """
-    Returns a local Path to the downloaded media file.
-    Uses requests for direct-file links and yt-dlp for platforms.
-    """
     url = url.strip()
     file_id = uuid.uuid4().hex
     exts = (".mp4", ".mkv", ".mov", ".webm", ".mp3", ".m4a", ".wav", ".aac", ".flac")
@@ -379,7 +417,7 @@ def _build_feedback_prompt(transcript_text: str, segments: List[dict]) -> Tuple[
     t_snip = _trim_middle(transcript_text or "", PROMPT_TRANSCRIPT_CHARS)
     lines = []
     for s in segments[:60]:
-        txt = (s.get("text","").strip().replace("\n"," "))[:90]
+        txt = (s.get("text","" ).strip().replace("\n"," "))[:90]
         if txt:
             lines.append(f"{_mmss(s.get('start',0))}–{_mmss(s.get('end',0))} {txt}")
 
@@ -387,8 +425,11 @@ def _build_feedback_prompt(transcript_text: str, segments: List[dict]) -> Tuple[
         "You are “TeachCoach”. Only pedagogy-improvement advice (no audio/production; no praise). "
         "Detect topics; then produce:\n"
         "0) Detected Topics (bullets)\n"
-        "1) Top 3 Improvements (fix + why + how)\n"
-        "2) Add These Examples (2–3)\n"
+        "1) Top 5 Improvements (fix + why + how)\n"
+        "2) Minute-by-minute Fixes “(mm:ss) → fix”\n"
+        "3) Add These Examples (2–3)\n"
+        "4) Ask These Questions (4)\n"
+        "5) Next-Class Plan (10 steps)\n"
         "Be concrete with timestamps. Return markdown only."
     )
     user_msg = f"Transcript (truncated):\n{t_snip}\n\nSegments:\n" + "\n".join(lines)
@@ -494,7 +535,7 @@ def openrouter_feedback_model(transcript_text: str, segments: List[dict], model_
     r = requests.post(url, headers=headers, json=payload, timeout=PROVIDER_TIMEOUT)
     r.raise_for_status()
     j = r.json()
-    text = ((j.get("choices") or [{}])[0].get("message") or {}).get("content","").strip()
+    text = ((j.get("choices") or [{}])[0].get("message") or {}).get("content"," ").strip()
     if not text:
         raise RuntimeError(f"OpenRouter empty response: {j}")
     return text
@@ -517,7 +558,7 @@ def ollama_feedback(transcript_text: str, segments: List[dict]) -> str:
 
     system_msg = (
         "You are “TeachCoach”… (pedagogy advice only). "
-        "0) Topics  1) Top 3 Improvements   2) Examples  3) Questions(4)."
+        "0) Topics  1) Top 5 Improvements  2) (mm:ss)→fix  3) Examples  4) Questions(4)  5) Next-Class Plan(10)."
     )
     user_msg = f"Transcript (truncated):\n{t_snip}\n\nSegments:\n" + "\n".join(lines)
     merged = f"[SYSTEM]\n{system_msg}\n[/SYSTEM]\n[USER]\n{user_msg}\n[/USER]\n"
@@ -539,12 +580,29 @@ def ollama_feedback(transcript_text: str, segments: List[dict]) -> str:
         raise gr.Error("Ollama returned empty feedback.")
     return content
 
+def make_groq():
+    from groq import Groq
+    api_key = os.getenv("GROQ_API_KEY", "")
+    maybe_proxies = None
+    if os.getenv("FORCE_GROQ_PROXIES_JSON"):
+        import json as _j
+        try:
+            maybe_proxies = _j.loads(os.getenv("FORCE_GROQ_PROXIES_JSON"))
+        except Exception:
+            maybe_proxies = None
+    try:
+        if maybe_proxies:
+            return Groq(api_key=api_key, proxies=maybe_proxies)
+        return Groq(api_key=api_key)
+    except TypeError:
+        return Groq(api_key=api_key)
+
 def groq_feedback(transcript_text: str, segments: List[dict]) -> str:
     if Groq is None:
         raise RuntimeError("groq SDK not installed. Run: pip install groq")
     if not GROQ_API_KEY:
         raise RuntimeError("Set GROQ_API_KEY env var")
-    client = Groq(api_key=GROQ_API_KEY)
+    client = make_groq()
     system_msg, user_msg = _build_feedback_prompt(transcript_text, segments)
     resp = client.chat.completions.create(
         model=GROQ_MODEL,
@@ -563,7 +621,7 @@ def groq_scout_feedback(transcript_text: str, segments: List[dict]) -> str:
         raise RuntimeError("groq SDK not installed. Run: pip install groq")
     if not GROQ_API_KEY:
         raise RuntimeError("Set GROQ_API_KEY env var")
-    client = Groq(api_key=GROQ_API_KEY)
+    client = make_groq()
     system_msg, user_msg = _build_feedback_prompt(transcript_text, segments)
     resp = client.chat.completions.create(
         model=GROQ_SCOUT_MODEL,
@@ -577,9 +635,58 @@ def groq_scout_feedback(transcript_text: str, segments: List[dict]) -> str:
         raise RuntimeError("Groq (Llama-4-Scout) returned empty text")
     return text
 
-# ===================== Heuristic Q&A (local, no LLM) =====================
+# NEW: OpenAI feedback
+def openai_feedback(transcript_text: str, segments: List[dict]) -> str:
+    if OpenAI is None:
+        raise RuntimeError("openai SDK not installed. Run: pip install openai")
+    if not OPENAI_API_KEY:
+        raise RuntimeError("Set OPENAI_API_KEY env var")
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    system_msg, user_msg = _build_feedback_prompt(transcript_text, segments)
+    resp = client.chat.completions.create(
+        model=OPENAI_MODEL,
+        messages=[{"role":"system","content":system_msg},{"role":"user","content":user_msg}],
+        temperature=OPENAI_TEMP,
+        max_tokens=OPENAI_MAX_TOKENS,
+    )
+    text = (resp.choices[0].message.content or "").strip()
+    if not text:
+        raise RuntimeError("OpenAI returned empty text")
+    return text
+
+# UPDATED: Gemini feedback (map-reduce for long transcripts)
+def gemini_feedback(transcript_text: str, segments: list[dict]) -> str:
+    if genai is None:
+        raise RuntimeError("google-generativeai SDK not installed. Run: pip install google-generativeai")
+    if not GEMINI_API_KEY:
+        raise RuntimeError("Set GEMINI_API_KEY")
+    genai.configure(api_key=GEMINI_API_KEY)
+    model_g = genai.GenerativeModel(GEMINI_MODEL)
+
+    system_msg, user_msg = _build_feedback_prompt(transcript_text, segments)
+    parts = _chunk_text(user_msg, GEMINI_CHUNK_CHARS, GEMINI_OVERLAP)
+    partials: list[str] = []
+    for i, ch in enumerate(parts, 1):
+        resp = model_g.generate_content(
+            [{"text": system_msg},{"text": f"(Part {i} of {len(parts)})\n{ch}"}],
+            generation_config={"temperature": GEMINI_TEMP, "max_output_tokens": GEMINI_MAX_TOKENS},
+        )
+        partials.append((getattr(resp, "text", None) or "").strip())
+    if len(partials) == 1:
+        return partials[0]
+    resp = model_g.generate_content(
+        [
+            {"text": "Combine and deduplicate the partial analyses below into ONE cohesive report, "
+                      "strictly following the same 'TeachCoach' rubric with timestamps kept where present."},
+            {"text": "\n\n---\n\n".join(partials)}
+        ],
+        generation_config={"temperature": GEMINI_TEMP, "max_output_tokens": GEMINI_MAX_TOKENS},
+    )
+    return (getattr(resp, "text", None) or "").strip()
+
+# ===================== Heuristic Q&A (local) =====================
 Q_RE = re.compile(
-    r"(?:^|[\s\"“])(?:why|what|how|when|where|which|can|could|should|would|is|are|do|does)\b.*\?",
+    r"(?:^|[\s\"“])(?:why|what|how|when|where|which|can|could|should|would|is|are|do|does)\b.*?\?",
     re.IGNORECASE
 )
 
@@ -588,7 +695,6 @@ def qna_heuristic(segments: List[Dict[str, Any]]) -> Dict[str, Any]:
     sid_counter = 0
     last_sid = None
     last_q_end = -1e9
-
     for i, s in enumerate(segments):
         txt = (s.get("text","") or "").strip()
         if not txt:
@@ -602,7 +708,6 @@ def qna_heuristic(segments: List[Dict[str, Any]]) -> Dict[str, Any]:
                 sid = f"s{sid_counter}"
             last_sid = sid
             last_q_end = s["end"]
-
             answered = False
             for j in range(i+1, min(i+12, len(segments))):
                 s2 = segments[j]
@@ -612,10 +717,9 @@ def qna_heuristic(segments: List[Dict[str, Any]]) -> Dict[str, Any]:
                 if len(txt2.split()) >= 6 and "?" not in txt2:
                     answered = True
                     break
-
             questions.append({
-                "t_start": float(s.get("start",0.0) or 0.0),
-                "t_end": float(s.get("end",0.0) or 0.0),
+                "t_start": float(s.get("t_start", s.get("start",0.0))),
+                "t_end": float(s.get("t_end", s.get("end",0.0))),
                 "question": txt,
                 "student_id": sid,
                 "answered": answered,
@@ -639,7 +743,6 @@ def _items_from_heuristic(segments: List[dict]) -> List[dict]:
 def send_gmail_smtp(to_email: str, subject: str, body_text: str, body_html: Optional[str] = None) -> None:
     if not (GMAIL_USER and GMAIL_APP_PASSWORD):
         raise RuntimeError("Set GMAIL_USER and GMAIL_APP_PASSWORD env vars first.")
-
     msg = EmailMessage()
     msg["From"] = GMAIL_USER
     msg["To"] = to_email
@@ -647,7 +750,6 @@ def send_gmail_smtp(to_email: str, subject: str, body_text: str, body_html: Opti
     msg.set_content(body_text or "")
     if body_html:
         msg.add_alternative(body_html, subtype="html")
-
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
         if SMTP_DEBUG:
             s.set_debuglevel(1)
@@ -665,18 +767,116 @@ def send_report_to_recipients(recipients: List[str], subject: str, body_text: st
         except Exception as e:
             print(f"[email] failed → {a}: {e}")
 
-# ===================== Multi-provider selector =====================
-def get_feedbacks(transcript_text: str, segments: List[dict], mode: str) -> dict:
-    """
-    mode can be one of:
-      'groq' | 'scout' | 'ollama' |
-      'or_deepseek_r1d_70b' | 'or_gemma2_9b_it' |
-      'both' (groq + ollama) | 'all' (the above five)
-    """
-    m = (mode or "groq").lower()
+# ===================== ADAPTIVE WEIGHTING (NEW) =====================
 
+WEIGHTS_FILE = os.environ.get("MODEL_WEIGHTS_FILE", str(BASE_DIR / "model_weights.json"))
+
+# Provider base weights (least → most)
+PROVIDER_BASE_WEIGHTS = {
+    "openrouter": 1.0,   # least
+    "groq":       2.0,
+    "ollama":     3.0,
+    "gpt":        5.0,   # most
+    "gemini":     5.0,   # most (same as GPT)
+}
+
+BONUS_SCALE = 1.25        # strength of vote effect
+BONUS_MIN   = -2.0
+BONUS_MAX   =  2.0
+
+def _load_weights() -> Dict[str, Any]:
+    if not os.path.exists(WEIGHTS_FILE):
+        return {"votes": {}, "version": 1}
+    try:
+        return json.loads(Path(WEIGHTS_FILE).read_text())
+    except Exception:
+        return {"votes": {}, "version": 1}
+
+def _save_weights(data: Dict[str, Any]) -> None:
+    Path(WEIGHTS_FILE).write_text(json.dumps(data, indent=2, ensure_ascii=False))
+
+def _provider_for_model(model_key: str) -> str:
+    # normalize key to provider bucket
+    if model_key in ("openai",):
+        return "gpt"
+    if model_key in ("gemini",):
+        return "gemini"
+    if model_key in ("groq", "scout"):
+        return "groq"
+    if model_key.startswith("or_"):
+        return "openrouter"
+    if model_key in ("ollama",):
+        return "ollama"
+    # fallback: assume lower preference
+    return "openrouter"
+
+def _base_weight(model_key: str) -> float:
+    return PROVIDER_BASE_WEIGHTS.get(_provider_for_model(model_key), 1.0)
+
+def _vote_tuple(weights_store: Dict[str, Any], key: str) -> Tuple[int, int]:
+    v = weights_store.get("votes", {}).get(key, {})
+    return int(v.get("up", 0)), int(v.get("down", 0))
+
+def _bonus_from_votes(up: int, down: int) -> float:
+    # Smooth, spam-resistant; ln ratio with clamp
+    import math
+    bonus = math.log((up + 1) / (down + 1.0)) * BONUS_SCALE
+    return float(max(BONUS_MIN, min(BONUS_MAX, bonus)))
+
+def effective_weight(weights_store: Dict[str, Any], model_key: str) -> float:
+    base = _base_weight(model_key)
+    up, down = _vote_tuple(weights_store, model_key)
+    bonus = _bonus_from_votes(up, down)
+    return base + bonus
+
+def register_vote(model_key: str, upvote: bool) -> Dict[str, Any]:
+    store = _load_weights()
+    store.setdefault("votes", {})
+    rec = store["votes"].setdefault(model_key, {"up": 0, "down": 0})
+    if upvote:
+        rec["up"] = int(rec.get("up", 0)) + 1
+    else:
+        rec["down"] = int(rec.get("down", 0)) + 1
+    _save_weights(store)
+    return store
+
+def ranking_md(weights_store: Dict[str, Any], available_models: List[str]) -> str:
+    rows = []
+    for k in available_models:
+        up, down = _vote_tuple(weights_store, k)
+        wt = effective_weight(weights_store, k)
+        rows.append((k, wt, up, down, _provider_for_model(k), _base_weight(k)))
+    rows.sort(key=lambda r: r[1], reverse=True)
+    name_map = {
+        "openai": "OpenAI · GPT",
+        "gemini": "Google · Gemini",
+        "groq": "Groq (GPT-OSS-120B)",
+        "scout": "Groq (Llama-4-Scout)",
+        "ollama": "Ollama (local)",
+        "or_deepseek_r1d_70b": "OpenRouter · DeepSeek R1D 70B",
+        "or_gemma2_9b_it": "OpenRouter · Gemma2-9B-IT",
+    }
+    lines = ["**Model Ranking (higher is preferred)**",
+             "",
+             "| Rank | Model | Provider | Base | Bonus(votes) | Up | Down | Eff. Weight |",
+             "|---:|---|---|---:|---:|---:|---:|---:|"]
+    for i, (k, wt, up, down, prov, base) in enumerate(rows, 1):
+        bonus = wt - base
+        label = name_map.get(k, k)
+        lines.append(f"| {i} | {label} | {prov} | {base:.2f} | {bonus:+.2f} | {up} | {down} | {wt:.2f} |")
+    return "\n".join(lines)
+
+# ===================== Multi-provider selector (with ordering) =====================
+# mode one of:
+#   'groq' | 'scout' | 'ollama' |
+#   'or_deepseek_r1d_70b' | 'or_gemma2_9b_it' |
+#   'openai' | 'gemini' |
+#   'both' (groq + ollama) | 'all' (all seven)
+
+def get_feedbacks(transcript_text: str, segments: List[dict], mode: str) -> dict:
+    m = (mode or "groq").lower()
     if m == "all":
-        want = {"groq","scout","ollama","or_deepseek_r1d_70b","or_gemma2_9b_it"}
+        want = {"groq","scout","ollama","or_deepseek_r1d_70b","or_gemma2_9b_it","openai","gemini"}
     elif m == "both":
         want = {"groq","ollama"}
     else:
@@ -690,7 +890,10 @@ def get_feedbacks(transcript_text: str, segments: List[dict], mode: str) -> dict
             calls["scout"] = pool.submit(groq_scout_feedback, transcript_text, segments)
         if "ollama" in want:
             calls["ollama"] = pool.submit(ollama_feedback, transcript_text, segments)
-
+        if "openai" in want:
+            calls["openai"] = pool.submit(openai_feedback, transcript_text, segments)
+        if "gemini" in want:
+            calls["gemini"] = pool.submit(gemini_feedback, transcript_text, segments)
         for key, model_id in OPENROUTER_MODELS.items():
             if key in want:
                 calls[key] = pool.submit(openrouter_feedback_model, transcript_text, segments, model_id)
@@ -701,6 +904,11 @@ def get_feedbacks(transcript_text: str, segments: List[dict], mode: str) -> dict
                 out[name] = fut.result()
             except Exception as e:
                 out[name] = f"[{name} failed: {e}]"
+
+        # ORDER by effective weight (desc)
+        store = _load_weights()
+        ordered = sorted(out.keys(), key=lambda k: effective_weight(store, k), reverse=True)
+        out["_ordered_keys"] = ordered
         return out
 
 # ===================== Helpers for Q&A table =====================
@@ -739,7 +947,6 @@ def process(
      feedback_mode: str,
  ) -> Dict[str, Any]:
 
-    # Resolve input (upload or URL)
     def _normalize(v):
         if isinstance(v, list) and v:
             return v[0]
@@ -759,7 +966,6 @@ def process(
     if not chosen:
         raise gr.Error("No valid media provided (upload a file or paste a video URL).")
 
-    # Copy into workspace
     file_id = uuid.uuid4().hex
     dst_vid = WORK_DIR / f"{file_id}{chosen.suffix.lower()}"
     for _ in range(20):
@@ -772,7 +978,6 @@ def process(
     else:
         raise gr.Error("Could not read the file (Windows locked it). Close players and try again.")
 
-    # Transcribe
     media_len = _ffprobe_duration(dst_vid)
     use_long = ALWAYS_SEGMENT or (media_len and media_len > MAX_DIRECT_SEC)
     task_mode = "translate" if translate_to_en else "transcribe"
@@ -786,38 +991,36 @@ def process(
         else:
             segments, transcript_text, duration_sec = transcribe_short(wav, language_hint, initial_prompt, task_mode)
 
-    # local metrics + topics
     _ = analyze_transcript(transcript_text, segments, duration_sec)
     _ = extract_topics(transcript_text)
 
-    # Q&A (heuristic only)
     items = _items_from_heuristic(segments)
     q_rows = qna_rows_from_items(items)
     q_summary = qna_summary_from_items(items)
 
-    # feedback engines
     m = (feedback_mode or "").lower()
     if m == "both":
         mode = "both"
-    elif m in {"scout","ollama","groq","or_deepseek_r1d_70b","or_gemma2_9b_it","all"}:
+    elif m in {"scout","ollama","groq","or_deepseek_r1d_70b","or_gemma2_9b_it","all","openai","gemini"}:
         mode = m
     else:
         mode = "groq"
 
     feedback_map = get_feedbacks(transcript_text, segments, mode)
 
-    # primary
-    primary = (
-        feedback_map.get("groq")
-        or feedback_map.get("scout")
-        or feedback_map.get("or_deepseek_r1d_70b")
-        or feedback_map.get("or_gemma2_9b_it")
-        or feedback_map.get("ollama")
-        or "*No feedback produced.*"
-    )
-    used_engine = ", ".join(sorted(feedback_map.keys())) if feedback_map else "none"
+    # ORDERED primary by adaptive weight
+    ordered_keys = feedback_map.pop("_ordered_keys", [])
+    store = _load_weights()
 
-    # visuals
+    primary = "*No feedback produced.*"
+    for k in ordered_keys:
+        text = feedback_map.get(k)
+        if text and not str(text).startswith("[") :
+            primary = text
+            break
+    used_engine = ", ".join(ordered_keys) if ordered_keys else ", ".join(sorted(feedback_map.keys()))
+
+    # visuals: append to each feedback
     visuals: Dict[str, Any] = {}
     if analyze_visuals_flag:
         visuals = analyze_visuals(dst_vid, file_id)
@@ -830,25 +1033,25 @@ def process(
             add_section += "\n- *Board OCR (condensed)*:\n\n" + (board_text[:2000]) + ("\n..." if len(board_text)>2000 else "\n")
         for k in list(feedback_map.keys()):
             feedback_map[k] = (feedback_map[k] or "") + add_section
-        primary = primary + add_section
+        primary = (primary or "") + add_section
 
-    # Email (app-level only)
+    # Email
     if APP_EMAIL_ENABLED and APP_EMAIL_RECIPIENTS:
         parts = []
-        order = ["groq","scout","or_deepseek_r1d_70b","or_gemma2_9b_it","ollama"]
         titles = {
+            "openai": "OpenAI · GPT",
+            "gemini": "Google · Gemini",
             "groq": "Groq (GPT-OSS-120B)",
             "scout": "Groq (Llama-4-Scout)",
             "or_deepseek_r1d_70b": "OpenRouter · DeepSeek R1-Distill-Llama-70B",
             "or_gemma2_9b_it": "OpenRouter · Gemma2-9B-IT",
             "ollama": "Ollama (local)",
         }
-        for k in order:
+        for k in ordered_keys:
             if k in feedback_map and feedback_map[k]:
-                parts.append(f"### {titles[k]}\n{feedback_map[k]}")
-        if not parts:
+                parts.append(f"### {titles.get(k,k)}\n{feedback_map[k]}")
+        if not parts and primary:
             parts = [primary]
-
         subject = f"Lecture report — {file_id}"
         body_join = "\n\n".join(parts)
         text_body = (
@@ -877,6 +1080,10 @@ def process(
         except Exception as e:
             print("[email] batch send failed:", e)
 
+    # Build ranking markdown and voting model list
+    available_models = ordered_keys or list(feedback_map.keys())
+    rank_md = ranking_md(store, available_models)
+
     return {
         "file_id": file_id,
         "duration_sec": duration_sec,
@@ -884,11 +1091,14 @@ def process(
         "segments": segments,
         "paragraph_primary": primary,
         "feedback_map": feedback_map,
+        "ordered_keys": ordered_keys,
         "feedback_engine": used_engine,
         "qna_items": items,
         "qna_rows": q_rows,
         "qna_summary": q_summary,
         "visuals": visuals,
+        "ranking_md": rank_md,
+        "available_models": available_models,
     }
 
 # ===================== Visual analysis (hand-raise + board) =====================
@@ -1048,6 +1258,8 @@ def _choose_engine_choice(choice: Optional[str], default="groq") -> str:
         "ollama": "ollama",
         "openrouter · deepseek r1-distill-llama-70b": "or_deepseek_r1d_70b",
         "openrouter · gemma2-9b-it": "or_gemma2_9b_it",
+        "openai · gpt-4o-mini": "openai",
+        "google · gemini": "gemini",
         "both": "both",
         "all": "all",
     }
@@ -1056,7 +1268,7 @@ def _choose_engine_choice(choice: Optional[str], default="groq") -> str:
             return v
     return default
 
-with gr.Blocks(title="Lecture Analyzer — Whisper + Heuristic Q&A + Multi-Feedback + Visuals") as demo:
+with gr.Blocks(title="Lecture Analyzer — Whisper + Heuristic Q&A + Multi-Feedback + Visuals + Adaptive Ranking") as demo:
     gr.Markdown("# Lecture Analyzer")
 
     with gr.Row():
@@ -1083,6 +1295,8 @@ with gr.Blocks(title="Lecture Analyzer — Whisper + Heuristic Q&A + Multi-Feedb
                 choices=[
                     "Groq (gpt-oss-120b) — preferred",
                     "Groq (Llama-4-Scout)",
+                    "OpenAI · GPT-4o-mini",
+                    "Google · Gemini",
                     "Ollama (local)",
                     "OpenRouter · DeepSeek R1-Distill-Llama-70B",
                     "OpenRouter · Gemma2-9B-IT",
@@ -1090,7 +1304,7 @@ with gr.Blocks(title="Lecture Analyzer — Whisper + Heuristic Q&A + Multi-Feedb
                     "All (compare)"
                 ],
                 value="Groq (gpt-oss-120b) — preferred",
-                label="Choose model for feedback"
+                label="Choose model(s) for feedback"
             )
 
             gr.Markdown("### Visuals (optional)")
@@ -1106,9 +1320,13 @@ with gr.Blocks(title="Lecture Analyzer — Whisper + Heuristic Q&A + Multi-Feedb
 
     with gr.Tab("Teaching Feedback"):
         with gr.Tabs():
-            with gr.TabItem("Primary"):
-                feedback_primary_box = gr.Textbox(label="Primary feedback (first available)", lines=16)
+            with gr.TabItem("Primary (Top by Weight)"):
+                feedback_primary_box = gr.Textbox(label="Primary feedback (adaptive order)", lines=16)
                 engine_md = gr.Markdown()
+            with gr.TabItem("OpenAI · GPT"):
+                fb_openai = gr.Textbox(label="OpenAI feedback", lines=14)
+            with gr.TabItem("Google · Gemini"):
+                fb_gemini = gr.Textbox(label="Gemini feedback", lines=14)
             with gr.TabItem("Groq (GPT-OSS-120B)"):
                 fb_groq = gr.Textbox(label="Groq feedback", lines=14)
             with gr.TabItem("Groq (Llama-4-Scout)"):
@@ -1132,8 +1350,21 @@ with gr.Blocks(title="Lecture Analyzer — Whisper + Heuristic Q&A + Multi-Feedb
         visuals_md = gr.Markdown()
         board_gallery = gr.Gallery(label="Board snapshots", columns=3, height=300)
 
+    # NEW: Ranking & Voting
+    with gr.Tab("Model Ranking & Votes"):
+        ranking_md_box = gr.Markdown(value="Run analysis to see current ranking…")
+        with gr.Row():
+            vote_model_dd = gr.Dropdown(choices=[], label="Model to vote", interactive=True)
+        with gr.Row():
+            up_btn = gr.Button("👍 Thumbs Up", variant="primary")
+            down_btn = gr.Button("👎 Thumbs Down", variant="secondary")
+        vote_result_md = gr.Markdown()
+
     with gr.Tab("Raw JSON"):
         rawjson_box = gr.Code(label="Full Response (JSON)", language="json")
+
+    # STATE: last available models
+    available_models_state = gr.State([])
 
     def ui_process(vpath, video_url, language_hint, initial_prompt,
                    translate_to_en, feedback_engine_choice,
@@ -1159,7 +1390,7 @@ with gr.Blocks(title="Lecture Analyzer — Whisper + Heuristic Q&A + Multi-Feedb
         primary = out.get("paragraph_primary", "") or ""
         fb_map = out.get("feedback_map", {}) or {}
         engine_used = out.get("feedback_engine","none")
-        engine_note = f"*Feedback Engines:* {engine_used}  |  *Q&A Engine:* heuristic (local)"
+        engine_note = f"*Feedback Engines (ordered):* {out.get('ordered_keys', [])}  |  *Q&A Engine:* heuristic (local)"
 
         # Q&A
         rows = out.get("qna_rows") or []
@@ -1188,12 +1419,19 @@ with gr.Blocks(title="Lecture Analyzer — Whisper + Heuristic Q&A + Multi-Feedb
             v_md += f"*Board snapshots saved:* {len(snaps)}"
         gallery_imgs = snaps
 
+        # Ranking + vote dropdown
+        rank_md = out.get("ranking_md", "—")
+        choices = out.get("available_models", [])
+        dd_update = gr.update(choices=choices, value=(choices[0] if choices else None))
+
         progress(0.98, desc="Done")
         return (
             out.get("transcript_text"),
             seg_rows,
             primary,
             engine_note,
+            fb_map.get("openai",""),
+            fb_map.get("gemini",""),
             fb_map.get("groq",""),
             fb_map.get("scout",""),
             fb_map.get("ollama",""),
@@ -1203,7 +1441,10 @@ with gr.Blocks(title="Lecture Analyzer — Whisper + Heuristic Q&A + Multi-Feedb
             rows,
             v_md,
             gallery_imgs,
+            rank_md,
+            dd_update,
             json.dumps(out, ensure_ascii=False, indent=2),
+            choices,  # state
         )
 
     run.click(
@@ -1212,17 +1453,42 @@ with gr.Blocks(title="Lecture Analyzer — Whisper + Heuristic Q&A + Multi-Feedb
         outputs=[
             transcript_box, segtbl,
             feedback_primary_box, engine_md,
+            # tabs
+            fb_openai, fb_gemini,
             fb_groq, fb_scout, fb_ollama,
             fb_or_deepseek, fb_or_gemma,
             qna_summary_md, qna_tbl,
             visuals_md, board_gallery,
-            rawjson_box
+            ranking_md_box,      # Ranking tab
+            vote_model_dd,       # update choices/value
+            rawjson_box,
+            available_models_state,  # keep for voting
         ],
         api_name=False,
         show_api=False,
     )
 
-# ===================== Gradio launch (pick free port) =====================
+    # --- Voting handlers ---
+    def do_vote(selected_key: str, up: bool, available_models: List[str]):
+        if not selected_key:
+            return ("Select a model first.", ranking_md(_load_weights(), available_models))
+        store = register_vote(selected_key, upvote=up)
+        msg = f"Recorded {'👍 upvote' if up else '👎 downvote'} for **{selected_key}**."
+        md = ranking_md(store, available_models)
+        return (msg, md)
+
+    up_btn.click(
+        do_vote,
+        inputs=[vote_model_dd, gr.State(True), available_models_state],
+        outputs=[vote_result_md, ranking_md_box],
+    )
+    down_btn.click(
+        do_vote,
+        inputs=[vote_model_dd, gr.State(False), available_models_state],
+        outputs=[vote_result_md, ranking_md_box],
+    )
+
+# ===================== Gradio launch =====================
 def pick_free_port(preferred: Optional[str] = None, start: int = 7860, end: int  = 7890) -> Optional[int]:
     def free(p: int) -> bool:
         import socket as _s
