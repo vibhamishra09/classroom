@@ -1,4 +1,5 @@
-gradio==4.44.0
+
+gradio>=5.49.1
 requests>=2.31.0
 numpy>=1.24,<2.0
 pandas==2.2.2
@@ -15,12 +16,11 @@ pytesseract==0.3.10
 Pillow>=10.2.0
 
 # Video download
-yt-dlp==2025.01.15
+yt-dlp>=2024.10.22
 
 # Providers
-groq==0.11.0
+groq>=0.32.0
 openai>=1.35.9
-google-cloud-aiplatform>=1.56.0
-
+google-generativeai
 # If you use OpenCV anywhere, prefer headless build on servers:
 opencv-python-headless==4.10.0.84
