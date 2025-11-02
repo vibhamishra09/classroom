@@ -15,7 +15,8 @@ speech2/
 ├── outputs/
 └── README.md
 
-
+demo video
+https://drive.google.com/file/d/1-Rn6TaNa3KP38D1wWbyxIlVad2kEVoez/view?usp=sharing
 ⚠️ Never commit the secrets/ folder to GitHub — it is ignored via .gitignore.
 
 🔐 Secrets Setup
